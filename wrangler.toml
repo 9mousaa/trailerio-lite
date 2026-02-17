@@ -1,0 +1,8 @@
+name = "trailerio-lite"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Optional: KV namespace for persistent cache
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = "your-kv-namespace-id"
