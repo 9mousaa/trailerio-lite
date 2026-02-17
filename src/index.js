@@ -7,7 +7,13 @@ const MANIFEST = {
   name: 'Trailerio',
   description: 'Trailer addon - Apple TV, Plex, RT, Digital Digest, IMDb',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
-  resources: ['meta'],
+  resources: [
+    {
+      name: 'meta',
+      types: ['movie', 'series'],
+      idPrefixes: ['tt']
+    }
+  ],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
   catalogs: []
@@ -52,7 +58,7 @@ async function resolveAppleTV(imdbId) {
 
     const hlsMatch = html.match(/https:\/\/[^"]*\.m3u8[^"]*/);
     if (hlsMatch) {
-      return { url: hlsMatch[0].replace(/&amp;/g, '&'), provider: 'Apple TV' };
+      return { url: hlsMatch[0].replace(/&amp;/g, '&'), provider: 'Apple TV 1080p' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -90,7 +96,7 @@ async function resolvePlex(imdbId) {
     const url = trailer?.Media?.[0]?.url;
 
     if (url) {
-      return { url, provider: 'Plex' };
+      return { url, provider: 'Plex 1080p' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -135,7 +141,7 @@ async function resolveRottenTomatoes(imdbId) {
 
     if (urlMatch) {
       const url = urlMatch[0].replace(/&amp;/g, '&').replace(/formats=[^&]+/, 'formats=MPEG4') + '&format=redirect';
-      return { url, provider: 'Rotten Tomatoes' };
+      return { url, provider: 'Rotten Tomatoes 1080p' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -162,9 +168,10 @@ async function resolveDigitalDigest(imdbId) {
     const best = files.sort((a, b) => (b.resolution?.id || 0) - (a.resolution?.id || 0))[0];
 
     if (best?.fileUrl || best?.fileDownloadUrl) {
+      const quality = best.resolution?.label || '1080p';
       return {
         url: best.fileUrl || best.fileDownloadUrl,
-        provider: 'Digital Digest'
+        provider: `Digital Digest ${quality}`
       };
     }
   } catch (e) { /* silent fail */ }
@@ -197,7 +204,27 @@ async function resolveIMDb(imdbId) {
 
     const urlMatch = videoHtml.match(/"url":"(https:\/\/imdb-video\.media-imdb\.com[^"]+\.mp4[^"]*)"/);
     if (urlMatch) {
-      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb' };
+      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb 1080p' };
+    }
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// ============== TITLE RESOLVER ==============
+
+async function resolveTitle(imdbId) {
+  try {
+    const res = await fetchWithTimeout(
+      `https://www.imdb.com/title/${imdbId}/`,
+      { headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en'
+      }}
+    );
+    const html = await res.text();
+    const titleMatch = html.match(/<title>([^<]+) \(\d{4}\)/);
+    if (titleMatch) {
+      return titleMatch[1].trim();
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -206,13 +233,13 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, cache) {
-  const cacheKey = `trailer:v4:${imdbId}`;
+  const cacheKey = `trailer:v5:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
   }
 
-  // Run all resolvers in parallel for speed
+  // Run all resolvers in parallel for speed (including title)
   const resolvers = [
     { fn: resolveAppleTV, priority: 0 },
     { fn: resolvePlex, priority: 1 },
@@ -221,30 +248,36 @@ async function resolveTrailers(imdbId, cache) {
     { fn: resolveIMDb, priority: 4 }
   ];
 
-  const results = await Promise.all(
-    resolvers.map(async ({ fn, priority }) => {
+  const [titleResult, ...trailerResults] = await Promise.all([
+    resolveTitle(imdbId),
+    ...resolvers.map(async ({ fn, priority }) => {
       const result = await fn(imdbId);
       return result ? { ...result, priority } : null;
     })
-  );
+  ]);
 
   // Filter successful results and sort by priority (first = preferred)
-  const links = results
+  const links = trailerResults
     .filter(r => r !== null)
     .sort((a, b) => a.priority - b.priority)
-    .map(r => ({
+    .map((r, index) => ({
       trailers: r.url,
-      provider: r.provider
+      provider: index === 0 ? `⭐ ${r.provider}` : r.provider
     }));
 
+  const result = {
+    title: titleResult || imdbId,
+    links: links
+  };
+
   if (links.length > 0) {
-    const response = new Response(JSON.stringify(links), {
+    const response = new Response(JSON.stringify(result), {
       headers: { 'Cache-Control': `max-age=${CACHE_TTL}` }
     });
     await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
   }
 
-  return links;
+  return result;
 }
 
 // ============== REQUEST HANDLER ==============
@@ -281,14 +314,14 @@ export default {
       const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
 
-      const links = await resolveTrailers(imdbId, cache);
+      const result = await resolveTrailers(imdbId, cache);
 
       return new Response(JSON.stringify({
         meta: {
           id: imdbId,
           type: type,
-          name: imdbId,
-          links: links
+          name: result.title,
+          links: result.links
         }
       }), { headers: corsHeaders });
     }
