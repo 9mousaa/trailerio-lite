@@ -102,9 +102,10 @@ async function resolvePlex(imdbId) {
   return null;
 }
 
-// 3. Rotten Tomatoes - Fandango CDN
+// 3. Rotten Tomatoes - Fandango CDN (via SMIL resolution)
 async function resolveRottenTomatoes(imdbId) {
   try {
+    // Get RT slug from Wikidata
     const sparql = `SELECT ?id WHERE { ?item wdt:P345 "${imdbId}" . ?item wdt:P1258 ?id . }`;
     const wdRes = await fetchWithTimeout(
       `https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(sparql)}`,
@@ -114,34 +115,64 @@ async function resolveRottenTomatoes(imdbId) {
     let rtSlug = wdData.results?.bindings?.[0]?.id?.value;
     if (!rtSlug) return null;
 
-    const pathMatch = rtSlug.match(/((?:m|tv)\/.+)/);
-    if (pathMatch) rtSlug = pathMatch[1];
+    // Clean up slug (remove m/ or tv/ prefix if present)
+    rtSlug = rtSlug.replace(/^(m|tv)\//, '');
 
-    const pageRes = await fetchWithTimeout(
-      `https://www.rottentomatoes.com/${rtSlug}/`,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
-    );
+    // Go directly to videos page
+    const videosUrl = `https://www.rottentomatoes.com/m/${rtSlug}/videos`;
+    const pageRes = await fetchWithTimeout(videosUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    if (!pageRes.ok) return null;
+
     const html = await pageRes.text();
 
-    // Try direct theplatform URL first (old format)
-    let urlMatch = html.match(/https:\/\/link\.theplatform\.com\/s\/[^"]+/);
+    // Extract JSON from <script id="videos"> tag
+    const scriptMatch = html.match(/<script\s+id="videos"[^>]*>([\s\S]*?)<\/script>/i);
+    if (!scriptMatch) return null;
 
-    // If not found, look for video page URL and fetch it
-    if (!urlMatch) {
-      const videoPageMatch = html.match(/contentUrl":"(https:\/\/www\.rottentomatoes\.com\/[^"]+\/videos\/[^"]+)"/);
-      if (videoPageMatch) {
-        const videoPageRes = await fetchWithTimeout(
-          videoPageMatch[1],
-          { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } }
-        );
-        const videoHtml = await videoPageRes.text();
-        urlMatch = videoHtml.match(/https:\/\/link\.theplatform\.com\/s\/[^"]+/);
-      }
+    let videos;
+    try {
+      videos = JSON.parse(scriptMatch[1]);
+    } catch (e) {
+      return null;
     }
 
-    if (urlMatch) {
-      const url = urlMatch[0].replace(/&amp;/g, '&').replace(/formats=[^&]+/, 'formats=MPEG4') + '&format=redirect';
-      return { url, provider: 'Rotten Tomatoes 1080p' };
+    if (!Array.isArray(videos) || videos.length === 0) return null;
+
+    // Find trailers
+    const trailers = videos.filter(v => v.videoType === 'TRAILER');
+    if (trailers.length === 0) return null;
+
+    // Try to resolve via SMIL to get direct fandango.com URL
+    for (const trailer of trailers) {
+      if (!trailer.file) continue;
+
+      let videoUrl = trailer.file;
+
+      // Resolve theplatform URLs via SMIL
+      if (videoUrl.includes('theplatform.com') || videoUrl.includes('link.theplatform')) {
+        try {
+          const smilUrl = videoUrl.split('?')[0] + '?format=SMIL';
+          const smilRes = await fetchWithTimeout(smilUrl, {
+            headers: { 'Accept': 'application/smil+xml' }
+          }, 5000);
+
+          if (smilRes.ok) {
+            const smilXml = await smilRes.text();
+
+            // Extract video URLs with height from SMIL, pick highest quality
+            const matches = [...smilXml.matchAll(/src="(https:\/\/video\.fandango\.com[^"]+\.mp4)"[^>]*height="(\d+)"/g)];
+            if (matches.length > 0) {
+              matches.sort((a, b) => parseInt(b[2]) - parseInt(a[2]));
+              const bestUrl = matches[0][1];
+              const height = parseInt(matches[0][2]);
+              const quality = height >= 1080 ? '1080p' : `${height}p`;
+              return { url: bestUrl, provider: `Rotten Tomatoes ${quality}` };
+            }
+          }
+        } catch (e) { /* try next trailer */ }
+      }
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -233,7 +264,7 @@ async function resolveTitle(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, cache) {
-  const cacheKey = `trailer:v5:${imdbId}`;
+  const cacheKey = `trailer:v6:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
