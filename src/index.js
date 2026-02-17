@@ -4,10 +4,10 @@
 const MANIFEST = {
   id: 'io.trailerio.lite',
   version: '1.0.0',
-  name: 'Trailerio Lite',
+  name: 'Trailerio',
   description: 'Trailer addon - Apple TV, Plex, RT, Digital Digest, IMDb',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
-  resources: ['stream'],
+  resources: ['meta'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
   catalogs: []
@@ -52,7 +52,7 @@ async function resolveAppleTV(imdbId) {
 
     const hlsMatch = html.match(/https:\/\/[^"]*\.m3u8[^"]*/);
     if (hlsMatch) {
-      return { url: hlsMatch[0], source: 'Apple TV', quality: '4K' };
+      return { url: hlsMatch[0], provider: 'Apple TV' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -90,7 +90,7 @@ async function resolvePlex(imdbId) {
     const url = trailer?.Media?.[0]?.url;
 
     if (url) {
-      return { url, source: 'Plex', quality: '1080p' };
+      return { url, provider: 'Plex' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -120,7 +120,7 @@ async function resolveRottenTomatoes(imdbId) {
     const urlMatch = html.match(/https:\/\/link\.theplatform\.com\/s\/[^"]+/);
     if (urlMatch) {
       const url = urlMatch[0].replace(/formats=[^&]+/, 'formats=MPEG4') + '&format=redirect';
-      return { url, source: 'Rotten Tomatoes', quality: '1080p' };
+      return { url, provider: 'Rotten Tomatoes' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -149,8 +149,7 @@ async function resolveDigitalDigest(imdbId) {
     if (best?.fileUrl || best?.fileDownloadUrl) {
       return {
         url: best.fileUrl || best.fileDownloadUrl,
-        source: 'Digital Digest',
-        quality: best.resolution?.label || '1080p'
+        provider: 'Digital Digest'
       };
     }
   } catch (e) { /* silent fail */ }
@@ -183,7 +182,7 @@ async function resolveIMDb(imdbId) {
 
     const urlMatch = videoHtml.match(/"url":"(https:\/\/imdb-video\.media-imdb\.com[^"]+\.mp4[^"]*)"/);
     if (urlMatch) {
-      return { url: urlMatch[1].replace(/\\u0026/g, '&'), source: 'IMDb', quality: '1080p' };
+      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -191,33 +190,46 @@ async function resolveIMDb(imdbId) {
 
 // ============== MAIN RESOLVER ==============
 
-async function resolveTrailer(imdbId, cache) {
+async function resolveTrailers(imdbId, cache) {
   const cacheKey = `trailer:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
   }
 
-  const sources = [
-    resolveAppleTV,
-    resolvePlex,
-    resolveRottenTomatoes,
-    resolveDigitalDigest,
-    resolveIMDb
+  // Run all resolvers in parallel for speed
+  const resolvers = [
+    { fn: resolveAppleTV, priority: 0 },
+    { fn: resolvePlex, priority: 1 },
+    { fn: resolveRottenTomatoes, priority: 2 },
+    { fn: resolveDigitalDigest, priority: 3 },
+    { fn: resolveIMDb, priority: 4 }
   ];
 
-  for (const resolver of sources) {
-    const result = await resolver(imdbId);
-    if (result) {
-      const response = new Response(JSON.stringify(result), {
-        headers: { 'Cache-Control': `max-age=${CACHE_TTL}` }
-      });
-      await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
-      return result;
-    }
+  const results = await Promise.all(
+    resolvers.map(async ({ fn, priority }) => {
+      const result = await fn(imdbId);
+      return result ? { ...result, priority } : null;
+    })
+  );
+
+  // Filter successful results and sort by priority (first = preferred)
+  const links = results
+    .filter(r => r !== null)
+    .sort((a, b) => a.priority - b.priority)
+    .map(r => ({
+      trailers: r.url,
+      provider: r.provider
+    }));
+
+  if (links.length > 0) {
+    const response = new Response(JSON.stringify(links), {
+      headers: { 'Cache-Control': `max-age=${CACHE_TTL}` }
+    });
+    await cache.put(new Request(`https://cache/${cacheKey}`), response.clone());
   }
 
-  return null;
+  return links;
 }
 
 // ============== REQUEST HANDLER ==============
@@ -248,29 +260,22 @@ export default {
       return new Response(JSON.stringify({ status: 'ok', edge: request.cf?.colo }), { headers: corsHeaders });
     }
 
-    // Stream endpoint: /stream/{type}/{id}.json
-    const streamMatch = url.pathname.match(/^\/stream\/(movie|series)\/(.+)\.json$/);
-    if (streamMatch) {
-      const [, type, id] = streamMatch;
+    // Meta endpoint: /meta/{type}/{id}.json
+    const metaMatch = url.pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
+    if (metaMatch) {
+      const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
 
-      const trailer = await resolveTrailer(imdbId, cache);
+      const links = await resolveTrailers(imdbId, cache);
 
-      if (trailer) {
-        return new Response(JSON.stringify({
-          streams: [{
-            url: trailer.url,
-            name: `▶️ ${trailer.quality}`,
-            title: `Trailer (${trailer.source})`,
-            behaviorHints: {
-              notWebReady: trailer.url.includes('.m3u8'),
-              bingeGroup: 'trailerio-trailer'
-            }
-          }]
-        }), { headers: corsHeaders });
-      }
-
-      return new Response(JSON.stringify({ streams: [] }), { headers: corsHeaders });
+      return new Response(JSON.stringify({
+        meta: {
+          id: imdbId,
+          type: type,
+          name: imdbId,
+          links: links
+        }
+      }), { headers: corsHeaders });
     }
 
     // 404
