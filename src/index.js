@@ -127,13 +127,20 @@ async function resolveAppleTV(imdbId, meta) {
 
     const pageRes = await fetchWithTimeout(
       pageUrl,
-      { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' } }
+      {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
+        redirect: 'follow'
+      }
     );
     const html = await pageRes.text();
 
-    const hlsMatch = html.match(/https:\/\/[^"]*\.m3u8[^"]*/);
-    if (hlsMatch) {
-      return { url: hlsMatch[0].replace(/&amp;/g, '&'), provider: 'Apple TV 1080p' };
+    // Find HLS playlist URL (prefer non-subscription trailers)
+    const hlsMatches = html.match(/https:\/\/play[^"]*\.m3u8[^"]*/g) || [];
+    // Filter out subscription URLs, prefer trailer URLs
+    const trailerUrl = hlsMatches.find(u => !u.includes('subscription')) || hlsMatches[0];
+
+    if (trailerUrl) {
+      return { url: trailerUrl.replace(/&amp;/g, '&'), provider: 'Apple TV 1080p' };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -315,7 +322,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v10:${imdbId}`;
+  const cacheKey = `trailer:v11:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
