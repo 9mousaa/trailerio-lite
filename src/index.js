@@ -147,7 +147,7 @@ async function resolveAppleTV(imdbId, meta) {
 }
 
 // 2. Plex - IVA CDN 1080p
-async function resolvePlex(imdbId) {
+async function resolvePlex(imdbId, meta) {
   try {
     const tokenRes = await fetchWithTimeout('https://plex.tv/api/v2/users/anonymous', {
       method: 'POST',
@@ -161,8 +161,11 @@ async function resolvePlex(imdbId) {
     const { authToken } = await tokenRes.json();
     if (!authToken) return null;
 
+    // type=1 for movies, type=2 for TV shows
+    const plexType = meta?.actualType === 'series' ? 2 : 1;
+
     const matchRes = await fetchWithTimeout(
-      `https://metadata.provider.plex.tv/library/metadata/matches?type=1&guid=imdb://${imdbId}`,
+      `https://metadata.provider.plex.tv/library/metadata/matches?type=${plexType}&guid=imdb://${imdbId}`,
       { headers: { 'Accept': 'application/json', 'X-Plex-Token': authToken } }
     );
     const matchData = await matchRes.json();
@@ -322,7 +325,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v11:${imdbId}`;
+  const cacheKey = `trailer:v12:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -344,7 +347,7 @@ async function resolveTrailers(imdbId, type, cache) {
   // Step 3: Run all resolvers in parallel
   const resolvers = [
     { fn: (id) => resolveAppleTV(id, meta), priority: 0 },
-    { fn: (id) => resolvePlex(id), priority: 1 },
+    { fn: (id) => resolvePlex(id, meta), priority: 1 },
     { fn: (id) => resolveRottenTomatoes(id, meta), priority: 2 },
     { fn: (id) => resolveDigitalDigest(id), priority: 3 },
     { fn: (id) => resolveIMDb(id), priority: 4 }
