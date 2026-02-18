@@ -90,8 +90,8 @@ async function getWikidataIds(wikidataId) {
   try {
     const res = await fetchWithTimeout(
       `https://www.wikidata.org/wiki/Special:EntityData/${wikidataId}.json`,
-      { headers: { 'Accept': 'application/json' } },
-      5000
+      { headers: { 'Accept': 'application/json', 'User-Agent': 'TrailerioLite/1.0' } },
+      10000
     );
     const data = await res.json();
     const entity = data.entities?.[wikidataId];
@@ -325,7 +325,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v12:${imdbId}`;
+  const cacheKey = `trailer:v13:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
