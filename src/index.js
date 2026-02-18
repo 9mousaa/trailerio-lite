@@ -97,8 +97,13 @@ async function getWikidataIds(wikidataId) {
     const entity = data.entities?.[wikidataId];
     if (!entity) return {};
 
+    // P9586 = Apple TV movie ID, P9751 = Apple TV show ID
+    const appleTvMovieId = entity.claims?.P9586?.[0]?.mainsnak?.datavalue?.value;
+    const appleTvShowId = entity.claims?.P9751?.[0]?.mainsnak?.datavalue?.value;
+
     return {
-      appleTvId: entity.claims?.P9586?.[0]?.mainsnak?.datavalue?.value,
+      appleTvId: appleTvMovieId || appleTvShowId,
+      isAppleTvShow: !!appleTvShowId && !appleTvMovieId,
       rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value
     };
   } catch (e) {
@@ -114,8 +119,14 @@ async function resolveAppleTV(imdbId, meta) {
     let appleId = meta?.wikidataIds?.appleTvId;
     if (!appleId) return null;
 
+    // TV shows use /show/ path, movies use /movie/ path
+    const isShow = meta?.wikidataIds?.isAppleTvShow;
+    const pageUrl = isShow
+      ? `https://tv.apple.com/us/show/${appleId}`
+      : `https://tv.apple.com/us/movie/${appleId}`;
+
     const pageRes = await fetchWithTimeout(
-      `https://tv.apple.com/us/movie/${appleId}`,
+      pageUrl,
       { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' } }
     );
     const html = await pageRes.text();
@@ -304,7 +315,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v9:${imdbId}`;
+  const cacheKey = `trailer:v10:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
