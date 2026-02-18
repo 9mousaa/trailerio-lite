@@ -5,7 +5,7 @@ const MANIFEST = {
   id: 'io.trailerio.lite',
   version: '1.0.0',
   name: 'Trailerio',
-  description: 'Trailer addon - Apple TV, Plex, RT, Digital Digest, IMDb',
+  description: 'Trailer addon - Apple TV, Rotten Tomatoes, Plex, IMDb',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
   resources: [
     {
@@ -259,38 +259,7 @@ async function resolveRottenTomatoes(imdbId, meta) {
   return null;
 }
 
-// 4. Digital Digest - PeerTube 4K
-async function resolveDigitalDigest(imdbId) {
-  try {
-    const searchRes = await fetchWithTimeout(
-      `https://trailers.digitaldigest.com/api/v1/search/videos?search=${imdbId}&count=5`,
-      { headers: { 'Accept': 'application/json' } }
-    );
-    const searchData = await searchRes.json();
-    const video = searchData.data?.[0];
-    if (!video) return null;
-
-    const videoRes = await fetchWithTimeout(
-      `https://trailers.digitaldigest.com/api/v1/videos/${video.uuid}`,
-      { headers: { 'Accept': 'application/json' } }
-    );
-    const videoData = await videoRes.json();
-
-    const files = videoData.files || videoData.streamingPlaylists?.[0]?.files || [];
-    const best = files.sort((a, b) => (b.resolution?.id || 0) - (a.resolution?.id || 0))[0];
-
-    if (best?.fileUrl || best?.fileDownloadUrl) {
-      const quality = best.resolution?.label || '1080p';
-      return {
-        url: best.fileUrl || best.fileDownloadUrl,
-        provider: `Digital Digest ${quality}`
-      };
-    }
-  } catch (e) { /* silent fail */ }
-  return null;
-}
-
-// 5. IMDb - Fallback
+// 4. IMDb - Fallback
 async function resolveIMDb(imdbId) {
   try {
     const pageRes = await fetchWithTimeout(
@@ -325,40 +294,34 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v13:${imdbId}`;
+  const cacheKey = `trailer:v14:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
   }
 
-  // Step 1: Get TMDB metadata (includes Wikidata ID)
-  const tmdbMeta = await getTMDBMetadata(imdbId, type);
+  // PHASE 1: Start IMDb immediately (needs nothing) + TMDB find in parallel
+  const [imdbResult, tmdbMeta] = await Promise.all([
+    resolveIMDb(imdbId).then(r => r ? { ...r, priority: 3 } : null),
+    getTMDBMetadata(imdbId, type)
+  ]);
 
-  // Step 2: Get Wikidata IDs (Apple TV, RT) if we have a Wikidata ID
-  const wikidataIds = tmdbMeta?.wikidataId
-    ? await getWikidataIds(tmdbMeta.wikidataId)
-    : {};
+  // PHASE 2: Start Plex (needs actualType) + Wikidata lookup in parallel
+  const [plexResult, wikidataIds] = await Promise.all([
+    resolvePlex(imdbId, tmdbMeta).then(r => r ? { ...r, priority: 2 } : null),
+    tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({})
+  ]);
 
-  const meta = {
-    ...tmdbMeta,
-    wikidataIds
-  };
+  const meta = { ...tmdbMeta, wikidataIds };
 
-  // Step 3: Run all resolvers in parallel
-  const resolvers = [
-    { fn: (id) => resolveAppleTV(id, meta), priority: 0 },
-    { fn: (id) => resolvePlex(id, meta), priority: 1 },
-    { fn: (id) => resolveRottenTomatoes(id, meta), priority: 2 },
-    { fn: (id) => resolveDigitalDigest(id), priority: 3 },
-    { fn: (id) => resolveIMDb(id), priority: 4 }
-  ];
+  // PHASE 3: Start Apple TV + RT in parallel (need Wikidata IDs)
+  const [appleTvResult, rtResult] = await Promise.all([
+    resolveAppleTV(imdbId, meta).then(r => r ? { ...r, priority: 0 } : null),
+    resolveRottenTomatoes(imdbId, meta).then(r => r ? { ...r, priority: 1 } : null)
+  ]);
 
-  const trailerResults = await Promise.all(
-    resolvers.map(async ({ fn, priority }) => {
-      const result = await fn(imdbId);
-      return result ? { ...result, priority } : null;
-    })
-  );
+  // Collect all results
+  const trailerResults = [appleTvResult, rtResult, plexResult, imdbResult];
 
   // Filter successful results and sort by priority (first = preferred)
   const links = trailerResults
