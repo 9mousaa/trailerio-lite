@@ -1,4 +1,4 @@
-name = "trailerio-lite"
+name = "t"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
