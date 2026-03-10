@@ -44,16 +44,15 @@ function parseSMIL(smilXml) {
   const videoTags = [...smilXml.matchAll(/<video[^>]+src="(https:\/\/video\.fandango\.com[^"]+\.mp4)"[^>]*/g)];
   const videos = videoTags.map(m => {
     const tag = m[0];
+    const widthMatch = tag.match(/width="(\d+)"/);
     const heightMatch = tag.match(/height="(\d+)"/);
     const bitrateMatch = tag.match(/system-bitrate="(\d+)"/);
-    return {
-      url: m[1],
-      height: heightMatch ? parseInt(heightMatch[1]) : 0,
-      bitrate: bitrateMatch ? Math.round(parseInt(bitrateMatch[1]) / 1000) : 0
-    };
+    const height = heightMatch ? parseInt(heightMatch[1]) : 0;
+    const width = widthMatch ? parseInt(widthMatch[1]) : Math.round(height * 16 / 9);
+    return { url: m[1], width, height, bitrate: bitrateMatch ? Math.round(parseInt(bitrateMatch[1]) / 1000) : 0 };
   });
   if (videos.length === 0) return null;
-  videos.sort((a, b) => b.bitrate - a.bitrate || b.height - a.height);
+  videos.sort((a, b) => b.bitrate - a.bitrate || b.width - a.width);
   return videos[0];
 }
 
@@ -172,14 +171,15 @@ async function resolveAppleTV(imdbId, meta) {
         if (streamMatches.length > 0) {
           streamMatches.sort((a, b) => parseInt(b[1]) - parseInt(a[1]));
           const maxBandwidth = parseInt(streamMatches[0][1]);
+          const width = streamMatches[0][2] ? parseInt(streamMatches[0][2]) : 0;
           const height = streamMatches[0][3] ? parseInt(streamMatches[0][3]) : 0;
           const bitrate = Math.round(maxBandwidth / 1000);
-          const quality = height >= 2160 ? '4K' : height >= 1080 ? '1080p' : height >= 720 ? '720p' : '1080p';
-          return { url: cleanUrl, provider: `Apple TV ${quality}`, bitrate, height };
+          const quality = width >= 3840 ? '4K' : width >= 1900 ? '1080p' : width >= 1200 ? '720p' : '1080p';
+          return { url: cleanUrl, provider: `Apple TV ${quality}`, bitrate, width, height };
         }
       } catch (e) { /* m3u8 parse failed, still return URL */ }
 
-      return { url: cleanUrl, provider: 'Apple TV', bitrate: 0, height: 0 };
+      return { url: cleanUrl, provider: 'Apple TV', bitrate: 0, width: 0, height: 0 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -222,7 +222,7 @@ async function resolvePlex(imdbId, meta) {
     if (url) {
       const kbrateMatch = url.match(/videokbrate=(\d+)/);
       const bitrate = kbrateMatch ? parseInt(kbrateMatch[1]) : 5000;
-      return { url, provider: 'Plex 1080p', bitrate, height: 1080 };
+      return { url, provider: 'Plex 1080p', bitrate, width: 1920, height: 1080 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -284,8 +284,8 @@ async function resolveRottenTomatoes(imdbId, meta) {
             const smilXml = await smilRes.text();
             const best = parseSMIL(smilXml);
             if (best) {
-              const quality = best.height >= 1080 ? '1080p' : `${best.height}p`;
-              return { url: best.url, provider: `Rotten Tomatoes ${quality}`, bitrate: best.bitrate || 5000, height: best.height };
+              const quality = best.width >= 1900 ? '1080p' : `${best.height}p`;
+              return { url: best.url, provider: `Rotten Tomatoes ${quality}`, bitrate: best.bitrate || 5000, width: best.width, height: best.height };
             }
           }
         } catch (e) { /* try next trailer */ }
@@ -338,8 +338,8 @@ async function resolveFandango(imdbId, meta) {
     const smilXml = await smilRes.text();
     const best = parseSMIL(smilXml);
     if (best) {
-      const quality = best.height >= 1080 ? '1080p' : `${best.height}p`;
-      return { url: best.url, provider: `Fandango ${quality}`, bitrate: best.bitrate || 8000, height: best.height };
+      const quality = best.width >= 1900 ? '1080p' : `${best.height}p`;
+      return { url: best.url, provider: `Fandango ${quality}`, bitrate: best.bitrate || 8000, width: best.width, height: best.height };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -369,8 +369,9 @@ async function resolveMUBI(imdbId, meta) {
 
     const best = trailers[0];
     const height = profileOrder[best.profile] || 0;
+    const width = Math.round(height * 16 / 9);
 
-    return { url: best.url, provider: `MUBI ${best.profile}`, bitrate: 0, height };
+    return { url: best.url, provider: `MUBI ${best.profile}`, bitrate: 0, width, height };
   } catch (e) { /* silent fail */ }
   return null;
 }
@@ -401,7 +402,7 @@ async function resolveIMDb(imdbId) {
 
     const urlMatch = videoHtml.match(/"url":"(https:\/\/imdb-video\.media-imdb\.com[^"]+\.mp4[^"]*)"/);
     if (urlMatch) {
-      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0, height: 0 };
+      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0, width: 0, height: 0 };
     }
   } catch (e) { /* silent fail */ }
   return null;
@@ -410,7 +411,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v18:${imdbId}`;
+  const cacheKey = `trailer:v19:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -442,7 +443,7 @@ async function resolveTrailers(imdbId, type, cache) {
   const seen = new Set();
   const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, imdbResult]
     .filter(r => r !== null)
-    .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)
+    .sort((a, b) => b.width - a.width || b.bitrate - a.bitrate)
     .filter(r => {
       if (seen.has(r.url)) return false;
       seen.add(r.url);
