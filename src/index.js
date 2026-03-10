@@ -3,9 +3,9 @@
 
 const MANIFEST = {
   id: 'io.trailerio.lite',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'Trailerio',
-  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, IMDb',
+  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, IMDb',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
   resources: [
     {
@@ -103,7 +103,7 @@ async function getTMDBMetadata(imdbId, type = 'movie') {
   }
 }
 
-// Get Apple TV / RT / Fandango IDs from Wikidata entity
+// Get Apple TV / RT / Fandango / MUBI IDs from Wikidata entity
 async function getWikidataIds(wikidataId) {
   if (!wikidataId) return {};
 
@@ -125,7 +125,8 @@ async function getWikidataIds(wikidataId) {
       appleTvId: appleTvMovieId || appleTvShowId,
       isAppleTvShow: !!appleTvShowId && !appleTvMovieId,
       rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value,
-      fandangoId: entity.claims?.P5693?.[0]?.mainsnak?.datavalue?.value
+      fandangoId: entity.claims?.P5693?.[0]?.mainsnak?.datavalue?.value,
+      mubiId: entity.claims?.P7299?.[0]?.mainsnak?.datavalue?.value
     };
   } catch (e) {
     return {};
@@ -344,7 +345,37 @@ async function resolveFandango(imdbId, meta) {
   return null;
 }
 
-// 5. IMDb - Fallback
+// 5. MUBI - Direct API with MP4 trailers
+async function resolveMUBI(imdbId, meta) {
+  try {
+    const mubiId = meta?.wikidataIds?.mubiId;
+    if (!mubiId) return null;
+
+    const res = await fetchWithTimeout(
+      `https://api.mubi.com/v3/films/${mubiId}`,
+      { headers: { 'CLIENT': 'web', 'CLIENT_COUNTRY': 'US' } }
+    );
+    if (!res.ok) return null;
+
+    const data = await res.json();
+
+    // Pick highest quality from optimised_trailers
+    const trailers = data.optimised_trailers;
+    if (!trailers || trailers.length === 0) return null;
+
+    // Sort by profile (1080p > 720p > 240p)
+    const profileOrder = { '1080p': 1080, '720p': 720, '480p': 480, '360p': 360, '240p': 240 };
+    trailers.sort((a, b) => (profileOrder[b.profile] || 0) - (profileOrder[a.profile] || 0));
+
+    const best = trailers[0];
+    const height = profileOrder[best.profile] || 0;
+
+    return { url: best.url, provider: `MUBI ${best.profile}`, bitrate: 0, height };
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// 6. IMDb - Fallback
 async function resolveIMDb(imdbId) {
   try {
     const pageRes = await fetchWithTimeout(
@@ -379,7 +410,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v17:${imdbId}`;
+  const cacheKey = `trailer:v18:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -399,16 +430,17 @@ async function resolveTrailers(imdbId, type, cache) {
 
   const meta = { ...tmdbMeta, wikidataIds };
 
-  // PHASE 3: Start Apple TV + RT + Fandango in parallel (need Wikidata IDs)
-  const [appleTvResult, rtResult, fandangoResult] = await Promise.all([
+  // PHASE 3: Start Apple TV + RT + Fandango + MUBI in parallel (need Wikidata IDs)
+  const [appleTvResult, rtResult, fandangoResult, mubiResult] = await Promise.all([
     resolveAppleTV(imdbId, meta),
     resolveRottenTomatoes(imdbId, meta),
-    resolveFandango(imdbId, meta)
+    resolveFandango(imdbId, meta),
+    resolveMUBI(imdbId, meta)
   ]);
 
   // Collect all results, sort by resolution first, then bitrate (highest = best)
   const seen = new Set();
-  const links = [fandangoResult, appleTvResult, rtResult, plexResult, imdbResult]
+  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, imdbResult]
     .filter(r => r !== null)
     .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate)
     .filter(r => {
