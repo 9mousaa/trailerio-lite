@@ -411,7 +411,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v19:${imdbId}`;
+  const cacheKey = `trailer:v20:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -439,11 +439,14 @@ async function resolveTrailers(imdbId, type, cache) {
     resolveMUBI(imdbId, meta)
   ]);
 
-  // Collect all results, sort by resolution first, then bitrate (highest = best)
+  // Quality tier from largest dimension (aspect-ratio agnostic)
+  const tier = (w, h) => { const m = Math.max(w, h); return m >= 3840 ? 3 : m >= 1900 ? 2 : m >= 1200 ? 1 : 0; };
+
+  // Sort by quality tier first, then bitrate decides within same tier
   const seen = new Set();
   const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, imdbResult]
     .filter(r => r !== null)
-    .sort((a, b) => b.width - a.width || b.bitrate - a.bitrate)
+    .sort((a, b) => tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate)
     .filter(r => {
       if (seen.has(r.url)) return false;
       seen.add(r.url);
