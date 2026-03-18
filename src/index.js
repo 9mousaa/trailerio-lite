@@ -19,10 +19,9 @@ const MANIFEST = {
   catalogs: []
 };
 
-const CACHE_TTL = 604800;        // 7 days (final result)
+const CACHE_TTL = 604800;          // 7 days (final result + Plex movie ID)
 const CACHE_TTL_STABLE = 31536000; // 1 year (TMDB + Wikidata — almost never change)
-const CACHE_TTL_WEEK = 604800;   // 7 days (Plex movie ID)
-const CACHE_TTL_HOUR = 3600;     // 1 hour (Plex anon token)
+const CACHE_TTL_HOUR = 3600;       // 1 hour (Plex anon token)
 const TMDB_API_KEY = 'bfe73358661a995b992ae9a812aa0d2f';
 
 // ============== UTILITIES ==============
@@ -266,7 +265,7 @@ async function resolvePlex(imdbId, meta, cache) {
       );
       const matchData = await matchRes.json();
       plexId = matchData.MediaContainer?.Metadata?.[0]?.ratingKey;
-      if (plexId && cache) await cachePut(cache, `plex:id:v1:${imdbId}`, { plexId }, CACHE_TTL_WEEK);
+      if (plexId && cache) await cachePut(cache, `plex:id:v1:${imdbId}`, { plexId }, CACHE_TTL);
     }
     if (!plexId) return null;
 
@@ -344,12 +343,10 @@ async function resolveRottenTomatoes(imdbId, meta) {
     for (const trailer of trailerOnly) {
       if (!trailer.file) continue;
 
-      let videoUrl = trailer.file;
-
       // Resolve theplatform URLs via SMIL
-      if (videoUrl.includes('theplatform.com') || videoUrl.includes('link.theplatform')) {
+      if (trailer.file.includes('theplatform.com') || trailer.file.includes('link.theplatform')) {
         try {
-          const smilUrl = videoUrl.split('?')[0] + '?format=SMIL';
+          const smilUrl = trailer.file.split('?')[0] + '?format=SMIL';
           const smilRes = await fetchWithTimeout(smilUrl, {
             headers: { 'Accept': 'application/smil+xml' }
           }, 5000);
@@ -363,6 +360,13 @@ async function resolveRottenTomatoes(imdbId, meta) {
             }
           }
         } catch (e) { /* try next trailer */ }
+      }
+    }
+
+    // Fallback: return first direct MP4 if SMIL resolution failed
+    for (const trailer of trailerOnly) {
+      if (trailer.file && !trailer.file.includes('theplatform') && trailer.file.endsWith('.mp4')) {
+        return { url: trailer.file, provider: 'Rotten Tomatoes 1080p', bitrate: 5000, width: 1920, height: 1080 };
       }
     }
   } catch (e) { /* silent fail */ }
@@ -470,9 +474,12 @@ async function resolveAllocine(imdbId, meta) {
     if (!movieRes.ok) return null;
     const movieData = await movieRes.json();
 
-    const mediaList = movieData?.feed?.media;
-    if (!Array.isArray(mediaList) || mediaList.length === 0) return null;
-    const cmediaId = mediaList[0]?.code ?? mediaList[0]?.$?.code;
+    // API returns trailers under feed.movie.trailerList.trailer (primary) or feed.media (fallback)
+    const trailerList = movieData?.feed?.movie?.trailerList?.trailer
+      || movieData?.feed?.media
+      || [];
+    if (!Array.isArray(trailerList) || trailerList.length === 0) return null;
+    const cmediaId = trailerList[0]?.code ?? trailerList[0]?.['$']?.code;
     if (!cmediaId) return null;
 
     // Step 2: Get direct MP4 URL
@@ -486,12 +493,12 @@ async function resolveAllocine(imdbId, meta) {
     const renditions = mediaData?.feed?.media?.[0]?.rendition;
     if (!Array.isArray(renditions) || renditions.length === 0) return null;
 
-    renditions.sort((a, b) => (b.$?.bandwidth || b.bandwidth || 0) - (a.$?.bandwidth || a.bandwidth || 0));
+    renditions.sort((a, b) => (b.bandwidth || b['$']?.bandwidth || 0) - (a.bandwidth || a['$']?.bandwidth || 0));
     const best = renditions[0];
-    const href = best?.href ?? best?.$?.href;
+    const href = best?.href ?? best?.['$']?.href;
     if (!href || !href.startsWith('http')) return null;
 
-    return { url: href, provider: 'AlloCiné', bitrate: Math.round((best.$?.bandwidth || best.bandwidth || 0) / 1000), width: 1920, height: 1080 };
+    return { url: href, provider: 'AlloCiné', bitrate: Math.round((best.bandwidth || best['$']?.bandwidth || 0) / 1000), width: 1920, height: 1080 };
   } catch (e) { /* silent fail */ }
   return null;
 }
@@ -565,7 +572,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v29:${imdbId}`;
+  const cacheKey = `trailer:v30:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
