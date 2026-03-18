@@ -5,7 +5,7 @@ const MANIFEST = {
   id: 'io.trailerio.lite',
   version: '1.2.0',
   name: 'Trailerio',
-  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, IMDb',
+  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, AlloCiné, Internet Archive, IMDb',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
   resources: [
     {
@@ -588,10 +588,10 @@ async function resolveTrailers(imdbId, type, cache) {
     resolvePlex(imdbId, tmdbMeta, cache),
     (async () => {
       if (!tmdbMeta?.wikidataId) return {};
-      const cached = await cacheGet(cache, `wikidata:v1:${tmdbMeta.wikidataId}`);
+      const cached = await cacheGet(cache, `wikidata:v2:${tmdbMeta.wikidataId}`);
       if (cached) return cached;
       const fresh = await getWikidataIds(tmdbMeta.wikidataId);
-      if (fresh) await cachePut(cache, `wikidata:v1:${tmdbMeta.wikidataId}`, fresh, CACHE_TTL_STABLE);
+      if (fresh) await cachePut(cache, `wikidata:v2:${tmdbMeta.wikidataId}`, fresh, CACHE_TTL_STABLE);
       return fresh || {};
     })()
   ]);
