@@ -289,7 +289,7 @@ async function resolveRottenTomatoes(imdbId, meta) {
 
     if (!Array.isArray(videos) || videos.length === 0) return null;
 
-    // Sort: full trailers first, then teasers, then clips/BTS as fallback
+    // Sort: full trailers first, then teasers — skip non-TRAILER clips entirely
     const junk = /teaser|clip|behind|featurette|sneak peek|opening|sequence/i;
     const priority = v => {
       const t = (v.title || '').toLowerCase();
@@ -300,8 +300,12 @@ async function resolveRottenTomatoes(imdbId, meta) {
     };
     videos.sort((a, b) => priority(a) - priority(b));
 
+    // Only attempt SMIL resolution on actual trailers (not clips/BTS)
+    const trailerOnly = videos.filter(v => priority(v) < 3);
+    if (trailerOnly.length === 0) return null;
+
     // Try to resolve via SMIL to get direct fandango.com URL
-    for (const trailer of videos) {
+    for (const trailer of trailerOnly) {
       if (!trailer.file) continue;
 
       let videoUrl = trailer.file;
@@ -445,7 +449,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v27:${imdbId}`;
+  const cacheKey = `trailer:v28:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
