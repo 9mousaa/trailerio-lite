@@ -57,9 +57,9 @@ async function cachePut(cache, key, data, ttl) {
 
 // ============== SMIL PARSER ==============
 
-// Parse SMIL XML and return best quality video (highest bitrate)
+// Parse SMIL XML and return best quality video (highest bitrate, Akamai CDN preferred over origin)
 function parseSMIL(smilXml) {
-  const videoTags = [...smilXml.matchAll(/<video[^>]+src="(https:\/\/video\.fandango\.com[^"]+\.mp4)"[^>]*/g)];
+  const videoTags = [...smilXml.matchAll(/<video[^>]+src="(https:\/\/(?:video\.fandango\.com|vs-prodamdfandango\.akamaized\.net)[^"]+\.mp4)"[^>]*/g)];
   const videos = videoTags.map(m => {
     const tag = m[0];
     const widthMatch = tag.match(/width="(\d+)"/);
@@ -67,10 +67,12 @@ function parseSMIL(smilXml) {
     const bitrateMatch = tag.match(/system-bitrate="(\d+)"/);
     const height = heightMatch ? parseInt(heightMatch[1]) : 0;
     const width = widthMatch ? parseInt(widthMatch[1]) : Math.round(height * 16 / 9);
-    return { url: m[1], width, height, bitrate: bitrateMatch ? Math.round(parseInt(bitrateMatch[1]) / 1000) : 0 };
+    const isAkamai = m[1].includes('akamaized.net') ? 1 : 0;
+    return { url: m[1], width, height, bitrate: bitrateMatch ? Math.round(parseInt(bitrateMatch[1]) / 1000) : 0, isAkamai };
   });
   if (videos.length === 0) return null;
-  videos.sort((a, b) => b.bitrate - a.bitrate || b.width - a.width);
+  // Highest bitrate first; for same bitrate, prefer Akamai CDN over fandango.com origin
+  videos.sort((a, b) => b.bitrate - a.bitrate || b.isAkamai - a.isAkamai || b.width - a.width);
   return videos[0];
 }
 
