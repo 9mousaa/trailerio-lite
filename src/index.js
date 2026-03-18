@@ -417,30 +417,28 @@ async function resolveFandango(imdbId, meta) {
   return null;
 }
 
-// 5. MUBI - Direct API with MP4 trailers
+// 5. MUBI - Film page scrape with MP4 trailers (API consistently returns 422)
 async function resolveMUBI(imdbId, meta) {
   try {
     const mubiId = meta?.wikidataIds?.mubiId;
     if (!mubiId) return null;
 
-    const res = await fetchWithTimeout(
-      `https://api.mubi.com/v3/films/${mubiId}`,
-      { headers: {
-        'client-id': 'web',
-        'client-country': 'US',
-        'accept': 'application/json, text/plain, */*',
-        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-      }}
+    // Scrape the film page — it embeds "optimised_trailers":[{url,profile},...] in a <script> tag
+    const pageRes = await fetchWithTimeout(
+      `https://mubi.com/en/films/${mubiId}`,
+      { headers: { 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' } }
     );
-    if (!res.ok) return null;
+    if (!pageRes.ok) return null;
 
-    const data = await res.json();
+    const html = await pageRes.text();
+    const match = html.match(/"optimised_trailers":(\[[\s\S]*?\])/);
+    if (!match) return null;
 
-    // Pick highest quality from optimised_trailers
-    const trailers = data.optimised_trailers;
-    if (!trailers || trailers.length === 0) return null;
+    let trailers;
+    try { trailers = JSON.parse(match[1]); } catch { return null; }
+    if (!Array.isArray(trailers) || trailers.length === 0) return null;
 
-    // Sort by profile (1080p > 720p > 240p)
+    // Sort by profile (1080p > 720p > 480p > 360p > 240p)
     const profileOrder = { '1080p': 1080, '720p': 720, '480p': 480, '360p': 360, '240p': 240 };
     trailers.sort((a, b) => (profileOrder[b.profile] || 0) - (profileOrder[a.profile] || 0));
 
