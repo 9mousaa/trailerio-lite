@@ -425,7 +425,12 @@ async function resolveMUBI(imdbId, meta) {
 
     const res = await fetchWithTimeout(
       `https://api.mubi.com/v3/films/${mubiId}`,
-      { headers: { 'CLIENT': 'web', 'CLIENT_COUNTRY': 'US' } }
+      { headers: {
+        'client-id': 'web',
+        'client-country': 'US',
+        'accept': 'application/json, text/plain, */*',
+        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+      }}
     );
     if (!res.ok) return null;
 
@@ -472,9 +477,19 @@ async function resolveIMDb(imdbId) {
     );
     const videoHtml = await videoRes.text();
 
+    // Try to extract quality-labelled variants first (e.g. "1080p", "720p")
+    const qualityOrder = { '1080p': 1080, '720p': 720, '480p': 480, '360p': 360, '240p': 240 };
+    const variants = [...videoHtml.matchAll(/"displayName":\{"value":"(\d+p)"[^}]*\}[^}]*"url":"(https:\/\/imdb-video\.media-imdb\.com[^"]+\.mp4[^"]*)"/g)];
+    if (variants.length > 0) {
+      variants.sort((a, b) => (qualityOrder[b[1]] || 0) - (qualityOrder[a[1]] || 0));
+      const best = variants[0];
+      const height = qualityOrder[best[1]] || 720;
+      return { url: best[2].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0, width: Math.round(height * 16 / 9), height };
+    }
+    // Fallback: grab first MP4 URL and assume 720p so it ranks above tier=0
     const urlMatch = videoHtml.match(/"url":"(https:\/\/imdb-video\.media-imdb\.com[^"]+\.mp4[^"]*)"/);
     if (urlMatch) {
-      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0, width: 0, height: 0 };
+      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0, width: 1280, height: 720 };
     }
   } catch (e) { /* silent fail */ }
   return null;
