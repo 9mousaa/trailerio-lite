@@ -19,7 +19,10 @@ const MANIFEST = {
   catalogs: []
 };
 
-const CACHE_TTL = 86400; // 24 hours
+const CACHE_TTL = 604800;        // 7 days (final result)
+const CACHE_TTL_STABLE = 31536000; // 1 year (TMDB + Wikidata — almost never change)
+const CACHE_TTL_WEEK = 604800;   // 7 days (Plex movie ID)
+const CACHE_TTL_HOUR = 3600;     // 1 hour (Plex anon token)
 const TMDB_API_KEY = 'bfe73358661a995b992ae9a812aa0d2f';
 
 // ============== UTILITIES ==============
@@ -35,6 +38,21 @@ async function fetchWithTimeout(url, options = {}, timeout = 8000) {
     clearTimeout(id);
     throw e;
   }
+}
+
+async function cacheGet(cache, key) {
+  const res = await cache.match(new Request(`https://cache/${key}`));
+  if (!res) return null;
+  try { return await res.json(); } catch { return null; }
+}
+
+async function cachePut(cache, key, data, ttl) {
+  await cache.put(
+    new Request(`https://cache/${key}`),
+    new Response(JSON.stringify(data), {
+      headers: { 'Cache-Control': `max-age=${ttl}` }
+    })
+  );
 }
 
 // ============== SMIL PARSER ==============
@@ -209,29 +227,43 @@ async function resolveAppleTV(imdbId, meta) {
 }
 
 // 2. Plex - IVA CDN 1080p
-async function resolvePlex(imdbId, meta) {
+async function resolvePlex(imdbId, meta, cache) {
   try {
-    const tokenRes = await fetchWithTimeout('https://plex.tv/api/v2/users/anonymous', {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'X-Plex-Client-Identifier': 'trailerio-lite',
-        'X-Plex-Product': 'Plex Web',
-        'X-Plex-Version': '4.141.1'
-      }
-    });
-    const { authToken } = await tokenRes.json();
+    let authToken;
+    const cachedToken = cache ? await cacheGet(cache, 'plex:token:v1') : null;
+    if (cachedToken?.authToken) {
+      authToken = cachedToken.authToken;
+    } else {
+      const tokenRes = await fetchWithTimeout('https://plex.tv/api/v2/users/anonymous', {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'X-Plex-Client-Identifier': 'trailerio-lite',
+          'X-Plex-Product': 'Plex Web',
+          'X-Plex-Version': '4.141.1'
+        }
+      });
+      ({ authToken } = await tokenRes.json());
+      if (authToken && cache) await cachePut(cache, 'plex:token:v1', { authToken }, CACHE_TTL_HOUR);
+    }
     if (!authToken) return null;
 
     // type=1 for movies, type=2 for TV shows
     const plexType = meta?.actualType === 'series' ? 2 : 1;
 
-    const matchRes = await fetchWithTimeout(
-      `https://metadata.provider.plex.tv/library/metadata/matches?type=${plexType}&guid=imdb://${imdbId}`,
-      { headers: { 'Accept': 'application/json', 'X-Plex-Token': authToken } }
-    );
-    const matchData = await matchRes.json();
-    const plexId = matchData.MediaContainer?.Metadata?.[0]?.ratingKey;
+    let plexId;
+    const cachedPlexId = cache ? await cacheGet(cache, `plex:id:v1:${imdbId}`) : null;
+    if (cachedPlexId?.plexId) {
+      plexId = cachedPlexId.plexId;
+    } else {
+      const matchRes = await fetchWithTimeout(
+        `https://metadata.provider.plex.tv/library/metadata/matches?type=${plexType}&guid=imdb://${imdbId}`,
+        { headers: { 'Accept': 'application/json', 'X-Plex-Token': authToken } }
+      );
+      const matchData = await matchRes.json();
+      plexId = matchData.MediaContainer?.Metadata?.[0]?.ratingKey;
+      if (plexId && cache) await cachePut(cache, `plex:id:v1:${imdbId}`, { plexId }, CACHE_TTL_WEEK);
+    }
     if (!plexId) return null;
 
     const extrasRes = await fetchWithTimeout(
@@ -458,13 +490,26 @@ async function resolveTrailers(imdbId, type, cache) {
   // PHASE 1: Start IMDb immediately (needs nothing) + TMDB find in parallel
   const [imdbResult, tmdbMeta] = await Promise.all([
     resolveIMDb(imdbId),
-    getTMDBMetadata(imdbId, type)
+    (async () => {
+      const cached = await cacheGet(cache, `tmdb:v1:${imdbId}`);
+      if (cached) return cached;
+      const fresh = await getTMDBMetadata(imdbId, type);
+      if (fresh) await cachePut(cache, `tmdb:v1:${imdbId}`, fresh, CACHE_TTL_STABLE);
+      return fresh;
+    })()
   ]);
 
   // PHASE 2: Start Plex (needs actualType) + Wikidata lookup in parallel
   const [plexResult, wikidataIds] = await Promise.all([
-    resolvePlex(imdbId, tmdbMeta),
-    tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({})
+    resolvePlex(imdbId, tmdbMeta, cache),
+    (async () => {
+      if (!tmdbMeta?.wikidataId) return {};
+      const cached = await cacheGet(cache, `wikidata:v1:${tmdbMeta.wikidataId}`);
+      if (cached) return cached;
+      const fresh = await getWikidataIds(tmdbMeta.wikidataId);
+      if (fresh) await cachePut(cache, `wikidata:v1:${tmdbMeta.wikidataId}`, fresh, CACHE_TTL_STABLE);
+      return fresh || {};
+    })()
   ]);
 
   const meta = { ...tmdbMeta, wikidataIds };
