@@ -459,6 +459,23 @@ async function resolveMUBI(imdbId, meta) {
   return null;
 }
 
+// AlloCiné API requires HMAC-SHA1 signed requests (partner android-v2)
+async function allocineSign(params) {
+  const sed = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const all = { ...params, sed };
+  const query = Object.keys(all).sort().map(k => `${k}=${all[k]}`).join('&');
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode('29d185d98c984a359e6e6f26a0474269'),
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+  const raw = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(query));
+  const sig = btoa(String.fromCharCode(...new Uint8Array(raw)));
+  return `${query}&sig=${encodeURIComponent(sig)}`;
+}
+
 // 6. AlloCiné - Direct MP4 via unofficial REST API v3 (~45k Wikidata entries via P1253)
 async function resolveAllocine(imdbId, meta) {
   try {
@@ -466,8 +483,9 @@ async function resolveAllocine(imdbId, meta) {
     if (!allocineId) return null;
 
     // Step 1: Get movie's trailer list
+    const qs1 = await allocineSign({ partner: 'YW5kcm9pZC12Mg', code: allocineId, profile: 'large', filter: 'trailer', format: 'json' });
     const movieRes = await fetchWithTimeout(
-      `https://api.allocine.fr/rest/v3/movie?partner=YW5kcm9pZC12Mg&code=${allocineId}&profile=large&filter=trailer&format=json`,
+      `https://api.allocine.fr/rest/v3/movie?${qs1}`,
       { headers: { 'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 11; Build/RQ3A.211001.001)' } }
     );
     if (!movieRes.ok) return null;
@@ -482,8 +500,9 @@ async function resolveAllocine(imdbId, meta) {
     if (!cmediaId) return null;
 
     // Step 2: Get direct MP4 URL
+    const qs2 = await allocineSign({ partner: 'YW5kcm9pZC12Mg', code: cmediaId, mediafmt: 'mp4-hip', profile: 'large', format: 'json' });
     const mediaRes = await fetchWithTimeout(
-      `https://api.allocine.fr/rest/v3/media?partner=YW5kcm9pZC12Mg&code=${cmediaId}&mediafmt=mp4-hip&profile=large&format=json`,
+      `https://api.allocine.fr/rest/v3/media?${qs2}`,
       { headers: { 'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 11; Build/RQ3A.211001.001)' } }
     );
     if (!mediaRes.ok) return null;
