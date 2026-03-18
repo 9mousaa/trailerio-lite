@@ -5,7 +5,7 @@ const MANIFEST = {
   id: 'io.trailerio.lite',
   version: '1.2.0',
   name: 'Trailerio',
-  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, AlloCiné, Internet Archive, IMDb',
+  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, AlloCiné, IMDb',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
   resources: [
     {
@@ -145,8 +145,7 @@ async function getWikidataIds(wikidataId) {
       rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value,
       fandangoId: entity.claims?.P5693?.[0]?.mainsnak?.datavalue?.value,
       mubiId: entity.claims?.P7299?.[0]?.mainsnak?.datavalue?.value,
-      allocineId: entity.claims?.P1253?.[0]?.mainsnak?.datavalue?.value,
-      internetArchiveId: entity.claims?.P724?.[0]?.mainsnak?.datavalue?.value
+      allocineId: entity.claims?.P1253?.[0]?.mainsnak?.datavalue?.value
     };
   } catch (e) {
     return {};
@@ -503,31 +502,7 @@ async function resolveAllocine(imdbId, meta) {
   return null;
 }
 
-// 7. Internet Archive - Direct MP4 (~2k Wikidata entries via P724, public domain films)
-async function resolveInternetArchive(imdbId, meta) {
-  try {
-    const archiveId = meta?.wikidataIds?.internetArchiveId;
-    if (!archiveId) return null;
-
-    const metaRes = await fetchWithTimeout(
-      `https://archive.org/metadata/${encodeURIComponent(archiveId)}`
-    );
-    if (!metaRes.ok) return null;
-    const data = await metaRes.json();
-
-    const files = (data.files || [])
-      .filter(f => f.name?.endsWith('.mp4') && f.format !== 'Metadata')
-      .sort((a, b) => (parseInt(b.size) || 0) - (parseInt(a.size) || 0));
-
-    if (files.length === 0) return null;
-    const best = files[0];
-
-    return { url: `https://archive.org/download/${archiveId}/${best.name}`, provider: 'Internet Archive', bitrate: 0, width: 1280, height: 720 };
-  } catch (e) { /* silent fail */ }
-  return null;
-}
-
-// 8. IMDb - Fallback
+// 7. IMDb - Fallback
 async function resolveIMDb(imdbId) {
   try {
     const pageRes = await fetchWithTimeout(
@@ -605,14 +580,13 @@ async function resolveTrailers(imdbId, type, cache) {
 
   const meta = { ...tmdbMeta, wikidataIds };
 
-  // PHASE 3: Start Apple TV + RT + Fandango + MUBI + AlloCiné + Internet Archive in parallel (need Wikidata IDs)
-  const [appleTvResult, rtResult, fandangoResult, mubiResult, allocineResult, iaResult] = await Promise.all([
+  // PHASE 3: Start Apple TV + RT + Fandango + MUBI + AlloCiné in parallel (need Wikidata IDs)
+  const [appleTvResult, rtResult, fandangoResult, mubiResult, allocineResult] = await Promise.all([
     resolveAppleTV(imdbId, meta),
     resolveRottenTomatoes(imdbId, meta),
     resolveFandango(imdbId, meta),
     resolveMUBI(imdbId, meta),
-    resolveAllocine(imdbId, meta),
-    resolveInternetArchive(imdbId, meta)
+    resolveAllocine(imdbId, meta)
   ]);
 
   // Quality tier from largest dimension (aspect-ratio agnostic)
@@ -620,7 +594,7 @@ async function resolveTrailers(imdbId, type, cache) {
 
   // Sort by quality tier first, then bitrate decides within same tier
   const seen = new Set();
-  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, allocineResult, iaResult, imdbResult]
+  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, allocineResult, imdbResult]
     .filter(r => r !== null)
     .sort((a, b) => tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate)
     .filter(r => {
