@@ -145,7 +145,9 @@ async function getWikidataIds(wikidataId) {
       isAppleTvShow: !!appleTvShowId && !appleTvMovieId,
       rtSlug: entity.claims?.P1258?.[0]?.mainsnak?.datavalue?.value,
       fandangoId: entity.claims?.P5693?.[0]?.mainsnak?.datavalue?.value,
-      mubiId: entity.claims?.P7299?.[0]?.mainsnak?.datavalue?.value
+      mubiId: entity.claims?.P7299?.[0]?.mainsnak?.datavalue?.value,
+      allocineId: entity.claims?.P1253?.[0]?.mainsnak?.datavalue?.value,
+      internetArchiveId: entity.claims?.P724?.[0]?.mainsnak?.datavalue?.value
     };
   } catch (e) {
     return {};
@@ -373,6 +375,9 @@ async function resolveFandango(imdbId, meta) {
     const fandangoId = meta?.wikidataIds?.fandangoId;
     if (!fandangoId) return null;
 
+    // Old alphanumeric IDs (e.g. "aa18701") are stale and 404 — skip fast
+    if (/[a-zA-Z]/.test(fandangoId)) return null;
+
     // Fetch movie overview page (shorthand URL redirects to canonical)
     const pageRes = await fetchWithTimeout(
       `https://www.fandango.com/x-${fandangoId}/movie-overview`,
@@ -451,7 +456,71 @@ async function resolveMUBI(imdbId, meta) {
   return null;
 }
 
-// 6. IMDb - Fallback
+// 6. AlloCiné - Direct MP4 via unofficial REST API v3 (~45k Wikidata entries via P1253)
+async function resolveAllocine(imdbId, meta) {
+  try {
+    const allocineId = meta?.wikidataIds?.allocineId;
+    if (!allocineId) return null;
+
+    // Step 1: Get movie's trailer list
+    const movieRes = await fetchWithTimeout(
+      `https://api.allocine.fr/rest/v3/movie?partner=YW5kcm9pZC12Mg&code=${allocineId}&profile=large&filter=trailer&format=json`,
+      { headers: { 'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 11; Build/RQ3A.211001.001)' } }
+    );
+    if (!movieRes.ok) return null;
+    const movieData = await movieRes.json();
+
+    const mediaList = movieData?.feed?.media;
+    if (!Array.isArray(mediaList) || mediaList.length === 0) return null;
+    const cmediaId = mediaList[0]?.code ?? mediaList[0]?.$?.code;
+    if (!cmediaId) return null;
+
+    // Step 2: Get direct MP4 URL
+    const mediaRes = await fetchWithTimeout(
+      `https://api.allocine.fr/rest/v3/media?partner=YW5kcm9pZC12Mg&code=${cmediaId}&mediafmt=mp4-hip&profile=large&format=json`,
+      { headers: { 'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 11; Build/RQ3A.211001.001)' } }
+    );
+    if (!mediaRes.ok) return null;
+    const mediaData = await mediaRes.json();
+
+    const renditions = mediaData?.feed?.media?.[0]?.rendition;
+    if (!Array.isArray(renditions) || renditions.length === 0) return null;
+
+    renditions.sort((a, b) => (b.$?.bandwidth || b.bandwidth || 0) - (a.$?.bandwidth || a.bandwidth || 0));
+    const best = renditions[0];
+    const href = best?.href ?? best?.$?.href;
+    if (!href || !href.startsWith('http')) return null;
+
+    return { url: href, provider: 'AlloCiné', bitrate: Math.round((best.$?.bandwidth || best.bandwidth || 0) / 1000), width: 1920, height: 1080 };
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// 7. Internet Archive - Direct MP4 (~2k Wikidata entries via P724, public domain films)
+async function resolveInternetArchive(imdbId, meta) {
+  try {
+    const archiveId = meta?.wikidataIds?.internetArchiveId;
+    if (!archiveId) return null;
+
+    const metaRes = await fetchWithTimeout(
+      `https://archive.org/metadata/${encodeURIComponent(archiveId)}`
+    );
+    if (!metaRes.ok) return null;
+    const data = await metaRes.json();
+
+    const files = (data.files || [])
+      .filter(f => f.name?.endsWith('.mp4') && f.format !== 'Metadata')
+      .sort((a, b) => (parseInt(b.size) || 0) - (parseInt(a.size) || 0));
+
+    if (files.length === 0) return null;
+    const best = files[0];
+
+    return { url: `https://archive.org/download/${archiveId}/${best.name}`, provider: 'Internet Archive', bitrate: 0, width: 1280, height: 720 };
+  } catch (e) { /* silent fail */ }
+  return null;
+}
+
+// 8. IMDb - Fallback
 async function resolveIMDb(imdbId) {
   try {
     const pageRes = await fetchWithTimeout(
@@ -496,7 +565,7 @@ async function resolveIMDb(imdbId) {
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v28:${imdbId}`;
+  const cacheKey = `trailer:v29:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -529,12 +598,14 @@ async function resolveTrailers(imdbId, type, cache) {
 
   const meta = { ...tmdbMeta, wikidataIds };
 
-  // PHASE 3: Start Apple TV + RT + Fandango + MUBI in parallel (need Wikidata IDs)
-  const [appleTvResult, rtResult, fandangoResult, mubiResult] = await Promise.all([
+  // PHASE 3: Start Apple TV + RT + Fandango + MUBI + AlloCiné + Internet Archive in parallel (need Wikidata IDs)
+  const [appleTvResult, rtResult, fandangoResult, mubiResult, allocineResult, iaResult] = await Promise.all([
     resolveAppleTV(imdbId, meta),
     resolveRottenTomatoes(imdbId, meta),
     resolveFandango(imdbId, meta),
-    resolveMUBI(imdbId, meta)
+    resolveMUBI(imdbId, meta),
+    resolveAllocine(imdbId, meta),
+    resolveInternetArchive(imdbId, meta)
   ]);
 
   // Quality tier from largest dimension (aspect-ratio agnostic)
@@ -542,7 +613,7 @@ async function resolveTrailers(imdbId, type, cache) {
 
   // Sort by quality tier first, then bitrate decides within same tier
   const seen = new Set();
-  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, imdbResult]
+  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, allocineResult, iaResult, imdbResult]
     .filter(r => r !== null)
     .sort((a, b) => tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate)
     .filter(r => {
