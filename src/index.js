@@ -1,9 +1,46 @@
 // Trailerio Lite - Cloudflare Workers Edition
 // Zero storage, edge-deployed trailer resolver for Fusion
 
-const MANIFEST = {
+// ============== CONFIG ==============
+
+const DEFAULT_CONFIG = {
+  src:  ['fandango', 'appletv', 'rt', 'plex', 'mubi'],
+  ct:   'trailer',   // 'trailer' | 'teaser' | 'all'
+  max:  5,           // 1 | 3 | 5 | 0=unlimited
+  rgn:  'US',        // ISO 3166-1 alpha-2
+  sort: 'quality',   // 'quality' | 'source'
+};
+
+function parseConfig(segment) {
+  if (!segment) return { ...DEFAULT_CONFIG, src: [...DEFAULT_CONFIG.src] };
+  try {
+    const json = atob(segment.replace(/-/g, '+').replace(/_/g, '/'));
+    const partial = JSON.parse(json);
+    return { ...DEFAULT_CONFIG, ...partial, src: partial.src || [...DEFAULT_CONFIG.src] };
+  } catch {
+    return { ...DEFAULT_CONFIG, src: [...DEFAULT_CONFIG.src] };
+  }
+}
+
+function configCacheKey(cfg) {
+  const sparse = {};
+  for (const k of Object.keys(DEFAULT_CONFIG).sort()) {
+    if (JSON.stringify(cfg[k]) !== JSON.stringify(DEFAULT_CONFIG[k])) sparse[k] = cfg[k];
+  }
+  return Object.keys(sparse).length ? ':' + JSON.stringify(sparse) : '';
+}
+
+function parseRequest(pathname) {
+  const m = pathname.match(/^\/([A-Za-z0-9_-]{10,})(\/.*)/);
+  if (m) return { segment: m[1], path: m[2] };
+  return { segment: null, path: pathname };
+}
+
+// ============== MANIFEST ==============
+
+const MANIFEST_BASE = {
   id: 'io.trailerio.lite',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'Trailerio',
   description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
@@ -16,7 +53,11 @@ const MANIFEST = {
   ],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
-  catalogs: []
+  catalogs: [],
+  behaviorHints: {
+    configurable: true,
+    configurationRequired: false
+  }
 };
 
 const CACHE_TTL = 86400; // 24 hours
@@ -39,7 +80,6 @@ async function fetchWithTimeout(url, options = {}, timeout = 8000) {
 
 // ============== SMIL PARSER ==============
 
-// Parse SMIL XML and return best quality video (highest bitrate)
 function parseSMIL(smilXml) {
   const videoTags = [...smilXml.matchAll(/<video[^>]+src="(https:\/\/video\.fandango\.com[^"]+\.mp4)"[^>]*/g)];
   const videos = videoTags.map(m => {
@@ -65,13 +105,11 @@ async function getTMDBMetadata(imdbId, type = 'movie') {
     );
     const findData = await findRes.json();
 
-    // Check requested type first, then fallback to other type
     let results = type === 'series'
       ? findData.tv_results
       : findData.movie_results;
     let actualType = type;
 
-    // Fallback: if not found in requested type, check the other
     if (!results || results.length === 0) {
       results = type === 'series'
         ? findData.movie_results
@@ -84,7 +122,6 @@ async function getTMDBMetadata(imdbId, type = 'movie') {
     const tmdbId = results[0].id;
     const title = results[0].title || results[0].name;
 
-    // Get external IDs including Wikidata
     const extRes = await fetchWithTimeout(
       `https://api.themoviedb.org/3/${actualType === 'series' ? 'tv' : 'movie'}/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`
     );
@@ -102,7 +139,6 @@ async function getTMDBMetadata(imdbId, type = 'movie') {
   }
 }
 
-// Get Apple TV / RT / Fandango / MUBI IDs from Wikidata entity
 async function getWikidataIds(wikidataId) {
   if (!wikidataId) return {};
 
@@ -116,7 +152,6 @@ async function getWikidataIds(wikidataId) {
     const entity = data.entities?.[wikidataId];
     if (!entity) return {};
 
-    // P9586 = Apple TV movie ID, P9751 = Apple TV show ID
     const appleTvMovieId = entity.claims?.P9586?.[0]?.mainsnak?.datavalue?.value;
     const appleTvShowId = entity.claims?.P9751?.[0]?.mainsnak?.datavalue?.value;
 
@@ -135,16 +170,16 @@ async function getWikidataIds(wikidataId) {
 // ============== SOURCE RESOLVERS ==============
 
 // 1. Apple TV - 4K HLS trailers
-async function resolveAppleTV(imdbId, meta) {
+async function resolveAppleTV(imdbId, meta, cfg) {
   try {
     let appleId = meta?.wikidataIds?.appleTvId;
     if (!appleId) return null;
 
-    // TV shows use /show/ path, movies use /movie/ path
+    const rgn = cfg.rgn.toLowerCase();
     const isShow = meta?.wikidataIds?.isAppleTvShow;
     const pageUrl = isShow
-      ? `https://tv.apple.com/us/show/${appleId}`
-      : `https://tv.apple.com/us/movie/${appleId}`;
+      ? `https://tv.apple.com/${rgn}/show/${appleId}`
+      : `https://tv.apple.com/${rgn}/movie/${appleId}`;
 
     const pageRes = await fetchWithTimeout(
       pageUrl,
@@ -155,16 +190,21 @@ async function resolveAppleTV(imdbId, meta) {
     );
     const html = await pageRes.text();
 
-    // Extract all m3u8 URLs, sorted by context preference
     const hlsRaw = [...html.matchAll(/https:\/\/play[^"]*\.m3u8[^"]*/g)];
-    const junk = /teaser|clip|behind|featurette|sneak|opening/i;
+
+    // Content-type aware junk filter
+    const junkAll    = /teaser|clip|behind|featurette|sneak|opening/i;
+    const junkNoTsr  = /clip|behind|featurette|sneak|opening/i;   // allows teasers
+
     const candidates = hlsRaw.map(m => ({
       url: m[0].replace(/&amp;/g, '&'),
       ctx: html.substring(Math.max(0, m.index - 500), m.index).toLowerCase()
     }));
-    // Sort: full trailer context first, then any trailer context, then rest
+
     candidates.sort((a, b) => {
       const score = v => {
+        if (cfg.ct === 'all') return v.ctx.includes('trailer') ? 0 : 1;
+        const junk = cfg.ct === 'teaser' ? junkNoTsr : junkAll;
         if (v.ctx.includes('trailer') && !junk.test(v.ctx)) return 0;
         if (v.ctx.includes('trailer')) return 1;
         return 2;
@@ -172,19 +212,16 @@ async function resolveAppleTV(imdbId, meta) {
       return score(a) - score(b);
     });
 
-    // Try each candidate, use feature.duration from master m3u8 to filter
-    // Skip teasers (<60s) and full episodes (>300s)
     for (const candidate of candidates) {
       try {
         const m3u8Res = await fetchWithTimeout(candidate.url, {}, 5000);
         const m3u8Text = await m3u8Res.text();
 
-        // Check duration from master playlist metadata (no extra fetch needed)
         if (candidates.length > 1) {
           const durMatch = m3u8Text.match(/com\.apple\.hls\.feature\.duration.*?VALUE="([\d.]+)"/);
           if (durMatch) {
             const dur = parseFloat(durMatch[1]);
-            if (dur < 60 || dur > 300) continue; // Skip teasers and full episodes
+            if (dur < 60 || dur > 300) continue;
           }
         }
 
@@ -200,7 +237,7 @@ async function resolveAppleTV(imdbId, meta) {
         return { url: candidate.url, provider: `Apple TV ${quality}`, bitrate, width, height };
       } catch (e) { continue; }
     }
-    // Last resort: return first URL without quality info
+
     if (candidates.length > 0) {
       return { url: candidates[0].url, provider: 'Apple TV', bitrate: 0, width: 0, height: 0 };
     }
@@ -209,7 +246,7 @@ async function resolveAppleTV(imdbId, meta) {
 }
 
 // 2. Plex - IVA CDN 1080p
-async function resolvePlex(imdbId, meta) {
+async function resolvePlex(imdbId, meta, cfg) {
   try {
     const tokenRes = await fetchWithTimeout('https://plex.tv/api/v2/users/anonymous', {
       method: 'POST',
@@ -223,7 +260,6 @@ async function resolvePlex(imdbId, meta) {
     const { authToken } = await tokenRes.json();
     if (!authToken) return null;
 
-    // type=1 for movies, type=2 for TV shows
     const plexType = meta?.actualType === 'series' ? 2 : 1;
 
     const matchRes = await fetchWithTimeout(
@@ -240,12 +276,21 @@ async function resolvePlex(imdbId, meta) {
     );
     const extrasData = await extrasRes.json();
     const extras = extrasData.MediaContainer?.Metadata || [];
-    // Prefer full trailers, fall back to teasers/clips/BTS if no trailer exists
-    const trailer = extras.find(m => m.subtype === 'trailer' && !/teaser|clip|behind|featurette/i.test(m.title))
-      || extras.find(m => m.subtype === 'trailer')
-      || extras[0];
-    const url = trailer?.Media?.[0]?.url;
 
+    let trailer;
+    if (cfg.ct === 'all') {
+      trailer = extras[0];
+    } else if (cfg.ct === 'teaser') {
+      trailer = extras.find(m => m.subtype === 'trailer' || /teaser/i.test(m.title))
+        || extras[0];
+    } else {
+      // 'trailer' (default)
+      trailer = extras.find(m => m.subtype === 'trailer' && !/teaser|clip|behind|featurette/i.test(m.title))
+        || extras.find(m => m.subtype === 'trailer')
+        || extras[0];
+    }
+
+    const url = trailer?.Media?.[0]?.url;
     if (url) {
       const kbrateMatch = url.match(/videokbrate=(\d+)/);
       const bitrate = kbrateMatch ? parseInt(kbrateMatch[1]) : 5000;
@@ -256,16 +301,14 @@ async function resolvePlex(imdbId, meta) {
 }
 
 // 3. Rotten Tomatoes - Fandango CDN (via SMIL resolution)
-async function resolveRottenTomatoes(imdbId, meta) {
+async function resolveRottenTomatoes(imdbId, meta, cfg) {
   try {
     let rtSlug = meta?.wikidataIds?.rtSlug;
     if (!rtSlug) return null;
 
-    // Handle both "m/slug" and "slug" formats
     const isTV = rtSlug.startsWith('tv/');
     rtSlug = rtSlug.replace(/^(m|tv)\//, '');
 
-    // Go directly to videos page (handle TV vs movie)
     const videosUrl = isTV
       ? `https://www.rottentomatoes.com/tv/${rtSlug}/videos`
       : `https://www.rottentomatoes.com/m/${rtSlug}/videos`;
@@ -275,8 +318,6 @@ async function resolveRottenTomatoes(imdbId, meta) {
     if (!pageRes.ok) return null;
 
     const html = await pageRes.text();
-
-    // Extract JSON from <script id="videos"> tag
     const scriptMatch = html.match(/<script\s+id="videos"[^>]*>([\s\S]*?)<\/script>/i);
     if (!scriptMatch) return null;
 
@@ -289,10 +330,17 @@ async function resolveRottenTomatoes(imdbId, meta) {
 
     if (!Array.isArray(videos) || videos.length === 0) return null;
 
-    // Sort: full trailers first, then teasers, then clips/BTS as fallback
     const junk = /teaser|clip|behind|featurette|sneak peek|opening|sequence/i;
+
     const priority = v => {
       const t = (v.title || '').toLowerCase();
+      if (cfg.ct === 'all') return 0;
+      if (cfg.ct === 'teaser') {
+        if (v.videoType === 'TRAILER' && !/clip|behind|featurette|sneak peek|opening|sequence/i.test(t)) return 0;
+        if (v.videoType === 'TRAILER') return 1;
+        return 2;
+      }
+      // 'trailer' (default)
       if (v.videoType === 'TRAILER' && t.includes('trailer') && !junk.test(t)) return 0;
       if (v.videoType === 'TRAILER' && !junk.test(t)) return 1;
       if (v.videoType === 'TRAILER') return 2;
@@ -300,13 +348,11 @@ async function resolveRottenTomatoes(imdbId, meta) {
     };
     videos.sort((a, b) => priority(a) - priority(b));
 
-    // Try to resolve via SMIL to get direct fandango.com URL
     for (const trailer of videos) {
       if (!trailer.file) continue;
 
       let videoUrl = trailer.file;
 
-      // Resolve theplatform URLs via SMIL
       if (videoUrl.includes('theplatform.com') || videoUrl.includes('link.theplatform')) {
         try {
           const smilUrl = videoUrl.split('?')[0] + '?format=SMIL';
@@ -330,12 +376,11 @@ async function resolveRottenTomatoes(imdbId, meta) {
 }
 
 // 4. Fandango - Direct theplatform.com (up to 1080p @ 8Mbps)
-async function resolveFandango(imdbId, meta) {
+async function resolveFandango(imdbId, meta, cfg) {
   try {
     const fandangoId = meta?.wikidataIds?.fandangoId;
     if (!fandangoId) return null;
 
-    // Fetch movie overview page (shorthand URL redirects to canonical)
     const pageRes = await fetchWithTimeout(
       `https://www.fandango.com/x-${fandangoId}/movie-overview`,
       {
@@ -346,8 +391,6 @@ async function resolveFandango(imdbId, meta) {
     if (!pageRes.ok) return null;
 
     const html = await pageRes.text();
-
-    // Extract jwPlayerData JSON from page
     const jwMatch = html.match(/jwPlayerData\s*=\s*(\{[\s\S]*?\});/);
     if (!jwMatch) return null;
 
@@ -361,7 +404,6 @@ async function resolveFandango(imdbId, meta) {
     const contentURL = jwData.contentURL;
     if (!contentURL || !contentURL.includes('theplatform.com')) return null;
 
-    // Resolve via SMIL for best quality MP4
     const smilUrl = contentURL.split('?')[0] + '?format=SMIL&formats=mpeg4';
     const smilRes = await fetchWithTimeout(smilUrl, {
       headers: { 'Accept': 'application/smil+xml' }
@@ -380,24 +422,21 @@ async function resolveFandango(imdbId, meta) {
 }
 
 // 5. MUBI - Direct API with MP4 trailers
-async function resolveMUBI(imdbId, meta) {
+async function resolveMUBI(imdbId, meta, cfg) {
   try {
     const mubiId = meta?.wikidataIds?.mubiId;
     if (!mubiId) return null;
 
     const res = await fetchWithTimeout(
       `https://api.mubi.com/v3/films/${mubiId}`,
-      { headers: { 'CLIENT': 'web', 'CLIENT_COUNTRY': 'US' } }
+      { headers: { 'CLIENT': 'web', 'CLIENT_COUNTRY': cfg.rgn } }
     );
     if (!res.ok) return null;
 
     const data = await res.json();
-
-    // Pick highest quality from optimised_trailers
     const trailers = data.optimised_trailers;
     if (!trailers || trailers.length === 0) return null;
 
-    // Sort by profile (1080p > 720p > 240p)
     const profileOrder = { '1080p': 1080, '720p': 720, '480p': 480, '360p': 360, '240p': 240 };
     trailers.sort((a, b) => (profileOrder[b.profile] || 0) - (profileOrder[a.profile] || 0));
 
@@ -412,8 +451,8 @@ async function resolveMUBI(imdbId, meta) {
 
 // ============== MAIN RESOLVER ==============
 
-async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v28:${imdbId}`;
+async function resolveTrailers(imdbId, type, cfg, cache) {
+  const cacheKey = `trailer:v29:${imdbId}${configCacheKey(cfg)}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
@@ -422,35 +461,58 @@ async function resolveTrailers(imdbId, type, cache) {
   // PHASE 1: TMDB metadata lookup
   const tmdbMeta = await getTMDBMetadata(imdbId, type);
 
-  // PHASE 2: Start Plex (needs actualType) + Wikidata lookup in parallel
+  const srcSet = new Set(cfg.src);
+
+  // PHASE 2: Plex + Wikidata in parallel
   const [plexResult, wikidataIds] = await Promise.all([
-    resolvePlex(imdbId, tmdbMeta),
+    srcSet.has('plex') ? resolvePlex(imdbId, tmdbMeta, cfg) : Promise.resolve(null),
     tmdbMeta?.wikidataId ? getWikidataIds(tmdbMeta.wikidataId) : Promise.resolve({})
   ]);
 
   const meta = { ...tmdbMeta, wikidataIds };
 
-  // PHASE 3: Start Apple TV + RT + Fandango + MUBI in parallel (need Wikidata IDs)
+  // PHASE 3: Apple TV + RT + Fandango + MUBI in parallel
   const [appleTvResult, rtResult, fandangoResult, mubiResult] = await Promise.all([
-    resolveAppleTV(imdbId, meta),
-    resolveRottenTomatoes(imdbId, meta),
-    resolveFandango(imdbId, meta),
-    resolveMUBI(imdbId, meta)
+    srcSet.has('appletv')  ? resolveAppleTV(imdbId, meta, cfg)         : Promise.resolve(null),
+    srcSet.has('rt')       ? resolveRottenTomatoes(imdbId, meta, cfg)  : Promise.resolve(null),
+    srcSet.has('fandango') ? resolveFandango(imdbId, meta, cfg)        : Promise.resolve(null),
+    srcSet.has('mubi')     ? resolveMUBI(imdbId, meta, cfg)            : Promise.resolve(null)
   ]);
 
-  // Quality tier from largest dimension (aspect-ratio agnostic)
   const tier = (w, h) => { const m = Math.max(w, h); return m >= 3840 ? 3 : m >= 1900 ? 2 : m >= 1200 ? 1 : 0; };
 
-  // Sort by quality tier first, then bitrate decides within same tier
+  const providerToSrc = {
+    'Fandango': 'fandango',
+    'Apple TV': 'appletv',
+    'Rotten Tomatoes': 'rt',
+    'Plex': 'plex',
+    'MUBI': 'mubi'
+  };
+
+  const srcRank = (r) => {
+    for (const [name, key] of Object.entries(providerToSrc)) {
+      if (r.provider.includes(name)) return cfg.src.indexOf(key);
+    }
+    return 999;
+  };
+
+  let results = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult]
+    .filter(r => r !== null);
+
+  if (cfg.sort === 'quality') {
+    results.sort((a, b) => tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate);
+  } else {
+    results.sort((a, b) => srcRank(a) - srcRank(b));
+  }
+
   const seen = new Set();
-  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult]
-    .filter(r => r !== null)
-    .sort((a, b) => tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate)
+  const links = results
     .filter(r => {
       if (seen.has(r.url)) return false;
       seen.add(r.url);
       return true;
     })
+    .slice(0, cfg.max === 0 ? Infinity : cfg.max)
     .map((r, index) => ({
       trailers: r.url,
       provider: index === 0 ? `⭐ ${r.provider}` : r.provider
@@ -471,6 +533,182 @@ async function resolveTrailers(imdbId, type, cache) {
   return result;
 }
 
+// ============== CONFIGURE PAGE ==============
+
+function serveConfigurePage(segment) {
+  const existingCfg = segment ? (() => {
+    try { return JSON.parse(atob(segment.replace(/-/g, '+').replace(/_/g, '/'))); } catch { return {}; }
+  })() : {};
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trailerio — Configure</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f0f17;color:#e0e0e0;font-family:system-ui,-apple-system,sans-serif;min-height:100vh;padding:2rem 1rem}
+.wrap{max-width:560px;margin:0 auto}
+h1{font-size:1.6rem;font-weight:700;color:#fff;margin-bottom:.25rem}
+.sub{color:#888;font-size:.9rem;margin-bottom:2rem}
+.card{background:#1a1a2e;border-radius:12px;padding:1.25rem 1.5rem;margin-bottom:1.25rem}
+.card h2{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#8a5cf7;margin-bottom:1rem}
+.sources{display:grid;grid-template-columns:1fr 1fr;gap:.5rem}
+label.check,label.radio{display:flex;align-items:center;gap:.5rem;cursor:pointer;padding:.4rem .5rem;border-radius:6px;transition:background .15s}
+label.check:hover,label.radio:hover{background:#ffffff0f}
+input[type=checkbox],input[type=radio]{accent-color:#8a5cf7;width:16px;height:16px;cursor:pointer}
+.row{display:flex;flex-wrap:wrap;gap:.5rem}
+select{background:#0f0f17;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:.45rem .75rem;font-size:.9rem;cursor:pointer;width:100%}
+select:focus{outline:none;border-color:#8a5cf7}
+.note{font-size:.78rem;color:#666;margin-top:.5rem}
+.btn{width:100%;padding:.75rem;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;margin-top:.5rem;transition:opacity .15s}
+.btn-primary{background:#8a5cf7;color:#fff}
+.btn-primary:hover{opacity:.85}
+.btn-secondary{background:#1a1a2e;color:#8a5cf7;border:1px solid #8a5cf7}
+.btn-secondary:hover{opacity:.75}
+.result{display:none;margin-top:1.5rem}
+.result.show{display:block}
+.url-box{background:#0f0f17;border:1px solid #333;border-radius:8px;padding:1rem;font-size:.8rem;word-break:break-all;color:#aaa;margin-bottom:.75rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Trailerio</h1>
+  <p class="sub">Customize your trailer sources and preferences</p>
+
+  <div class="card">
+    <h2>Sources</h2>
+    <div class="sources" id="sources">
+      <label class="check"><input type="checkbox" value="fandango"> Fandango</label>
+      <label class="check"><input type="checkbox" value="appletv"> Apple TV</label>
+      <label class="check"><input type="checkbox" value="rt"> Rotten Tomatoes</label>
+      <label class="check"><input type="checkbox" value="plex"> Plex</label>
+      <label class="check"><input type="checkbox" value="mubi"> MUBI</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Content Type</h2>
+    <div class="row">
+      <label class="radio"><input type="radio" name="ct" value="trailer"> Trailers only</label>
+      <label class="radio"><input type="radio" name="ct" value="teaser"> Include teasers</label>
+      <label class="radio"><input type="radio" name="ct" value="all"> Include all</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Max Results</h2>
+    <div class="row">
+      <label class="radio"><input type="radio" name="max" value="1"> 1 — Best only</label>
+      <label class="radio"><input type="radio" name="max" value="3"> 3</label>
+      <label class="radio"><input type="radio" name="max" value="5"> 5</label>
+      <label class="radio"><input type="radio" name="max" value="0"> All</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Language / Region</h2>
+    <select id="rgn">
+      <option value="US">English (US)</option>
+      <option value="GB">English (UK)</option>
+      <option value="DE">German</option>
+      <option value="FR">French</option>
+      <option value="ES">Spanish</option>
+      <option value="IT">Italian</option>
+      <option value="BR">Portuguese (Brazil)</option>
+      <option value="JP">Japanese</option>
+      <option value="KR">Korean</option>
+      <option value="SA">Arabic</option>
+    </select>
+    <p class="note">Affects Apple TV (dubbed trailers) and MUBI library. Fandango, RT, and Plex always serve English.</p>
+  </div>
+
+  <div class="card">
+    <h2>Sort Priority</h2>
+    <div class="row">
+      <label class="radio"><input type="radio" name="sort" value="quality"> Quality first</label>
+      <label class="radio"><input type="radio" name="sort" value="source"> Source order</label>
+    </div>
+  </div>
+
+  <button class="btn btn-primary" onclick="generate()">Generate Install URL</button>
+
+  <div class="result" id="result">
+    <div class="url-box" id="urlBox"></div>
+    <button class="btn btn-secondary" onclick="copyUrl()">Copy URL</button>
+    <button class="btn btn-primary" style="margin-top:.5rem" onclick="installStremio()">Install in Stremio</button>
+  </div>
+</div>
+
+<script>
+const DEFAULTS = {src:['fandango','appletv','rt','plex','mubi'],ct:'trailer',max:5,rgn:'US',sort:'quality'};
+const existing = ${JSON.stringify(existingCfg)};
+
+// Pre-populate from existing config
+window.addEventListener('DOMContentLoaded', () => {
+  const src = existing.src || DEFAULTS.src;
+  document.querySelectorAll('#sources input').forEach(cb => {
+    cb.checked = src.includes(cb.value);
+  });
+  const ct = existing.ct || DEFAULTS.ct;
+  document.querySelector('input[name=ct][value="'+ct+'"]').checked = true;
+  const max = existing.max !== undefined ? existing.max : DEFAULTS.max;
+  document.querySelector('input[name=max][value="'+max+'"]').checked = true;
+  document.getElementById('rgn').value = existing.rgn || DEFAULTS.rgn;
+  const sort = existing.sort || DEFAULTS.sort;
+  document.querySelector('input[name=sort][value="'+sort+'"]').checked = true;
+});
+
+function generate() {
+  const src = [...document.querySelectorAll('#sources input:checked')].map(c => c.value);
+  if (src.length === 0) { alert('Select at least one source.'); return; }
+  const ct   = document.querySelector('input[name=ct]:checked').value;
+  const max  = parseInt(document.querySelector('input[name=max]:checked').value);
+  const rgn  = document.getElementById('rgn').value;
+  const sort = document.querySelector('input[name=sort]:checked').value;
+
+  const sparse = {};
+  if (JSON.stringify(src) !== JSON.stringify(DEFAULTS.src)) sparse.src = src;
+  if (ct   !== DEFAULTS.ct)   sparse.ct   = ct;
+  if (max  !== DEFAULTS.max)  sparse.max  = max;
+  if (rgn  !== DEFAULTS.rgn)  sparse.rgn  = rgn;
+  if (sort !== DEFAULTS.sort) sparse.sort = sort;
+
+  const origin = window.location.origin;
+  let installUrl;
+  if (Object.keys(sparse).length === 0) {
+    installUrl = origin + '/manifest.json';
+  } else {
+    const segment = btoa(JSON.stringify(sparse)).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+    installUrl = origin + '/' + segment + '/manifest.json';
+  }
+
+  document.getElementById('urlBox').textContent = installUrl;
+  document.getElementById('result').classList.add('show');
+  window._installUrl = installUrl;
+}
+
+function copyUrl() {
+  navigator.clipboard.writeText(window._installUrl).then(() => {
+    const btn = event.target;
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy URL', 2000);
+  });
+}
+
+function installStremio() {
+  window.location.href = window._installUrl.replace(/^https?:/, 'stremio:');
+}
+</script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  });
+}
+
 // ============== REQUEST HANDLER ==============
 
 export default {
@@ -489,23 +727,37 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
+    const { segment, path } = parseRequest(url.pathname);
+    const cfg = parseConfig(segment);
+    const origin = url.origin;
+    const prefix = segment ? `/${segment}` : '';
+
+    // Configure page
+    if (path === '/configure' || path === '/configure/') {
+      return serveConfigurePage(segment);
+    }
+
     // Manifest
-    if (url.pathname === '/manifest.json') {
-      return new Response(JSON.stringify(MANIFEST), { headers: corsHeaders });
+    if (path === '/manifest.json') {
+      const manifest = {
+        ...MANIFEST_BASE,
+        configure: `${origin}${prefix}/configure`
+      };
+      return new Response(JSON.stringify(manifest), { headers: corsHeaders });
     }
 
     // Health check
-    if (url.pathname === '/health') {
+    if (path === '/health') {
       return new Response(JSON.stringify({ status: 'ok', edge: request.cf?.colo }), { headers: corsHeaders });
     }
 
     // Meta endpoint: /meta/{type}/{id}.json
-    const metaMatch = url.pathname.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
+    const metaMatch = path.match(/^\/meta\/(movie|series)\/(.+)\.json$/);
     if (metaMatch) {
       const [, type, id] = metaMatch;
       const imdbId = id.split(':')[0];
 
-      const result = await resolveTrailers(imdbId, type, cache);
+      const result = await resolveTrailers(imdbId, type, cfg, cache);
 
       return new Response(JSON.stringify({
         meta: {
