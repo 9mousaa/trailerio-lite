@@ -5,7 +5,7 @@ const MANIFEST = {
   id: 'io.trailerio.lite',
   version: '1.2.0',
   name: 'Trailerio',
-  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI, IMDb',
+  description: 'Trailer addon - Fandango, Apple TV, Rotten Tomatoes, Plex, MUBI',
   logo: 'https://raw.githubusercontent.com/9mousaa/trailerio-lite/main/icon.png',
   resources: [
     {
@@ -410,52 +410,17 @@ async function resolveMUBI(imdbId, meta) {
   return null;
 }
 
-// 6. IMDb - Fallback
-async function resolveIMDb(imdbId) {
-  try {
-    const pageRes = await fetchWithTimeout(
-      `https://www.imdb.com/title/${imdbId}/`,
-      { headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        'Accept-Language': 'en-US,en'
-      }}
-    );
-    const html = await pageRes.text();
-
-    const videoMatch = html.match(/\/video\/(vi\d+)/);
-    if (!videoMatch) return null;
-
-    const videoRes = await fetchWithTimeout(
-      `https://www.imdb.com/video/${videoMatch[1]}/`,
-      { headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        'Accept-Language': 'en-US,en'
-      }}
-    );
-    const videoHtml = await videoRes.text();
-
-    const urlMatch = videoHtml.match(/"url":"(https:\/\/imdb-video\.media-imdb\.com[^"]+\.mp4[^"]*)"/);
-    if (urlMatch) {
-      return { url: urlMatch[1].replace(/\\u0026/g, '&'), provider: 'IMDb', bitrate: 0, width: 0, height: 0 };
-    }
-  } catch (e) { /* silent fail */ }
-  return null;
-}
-
 // ============== MAIN RESOLVER ==============
 
 async function resolveTrailers(imdbId, type, cache) {
-  const cacheKey = `trailer:v27:${imdbId}`;
+  const cacheKey = `trailer:v28:${imdbId}`;
   const cached = await cache.match(new Request(`https://cache/${cacheKey}`));
   if (cached) {
     return await cached.json();
   }
 
-  // PHASE 1: Start IMDb immediately (needs nothing) + TMDB find in parallel
-  const [imdbResult, tmdbMeta] = await Promise.all([
-    resolveIMDb(imdbId),
-    getTMDBMetadata(imdbId, type)
-  ]);
+  // PHASE 1: TMDB metadata lookup
+  const tmdbMeta = await getTMDBMetadata(imdbId, type);
 
   // PHASE 2: Start Plex (needs actualType) + Wikidata lookup in parallel
   const [plexResult, wikidataIds] = await Promise.all([
@@ -478,7 +443,7 @@ async function resolveTrailers(imdbId, type, cache) {
 
   // Sort by quality tier first, then bitrate decides within same tier
   const seen = new Set();
-  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult, imdbResult]
+  const links = [fandangoResult, appleTvResult, rtResult, plexResult, mubiResult]
     .filter(r => r !== null)
     .sort((a, b) => tier(b.width, b.height) - tier(a.width, a.height) || b.bitrate - a.bitrate)
     .filter(r => {
